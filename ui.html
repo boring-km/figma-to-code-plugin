@@ -1,0 +1,269 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  :root{
+    --bg:#0f172a;
+    --panel:#0b1226;
+    --text:#e5e7eb;
+    --muted:#9ca3af;
+    --border:rgba(255,255,255,.12);
+    --btn:#1f2937;
+    --btn2:#111827;
+    --accent:#22c55e;
+  }
+  *{box-sizing:border-box}
+  body{margin:12px;font-family:Inter,Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
+  .card{background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));border:1px solid var(--border);border-radius:12px;padding:12px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .spacer{flex:1}
+  label{display:inline-flex;gap:6px;align-items:center;color:var(--muted);font-size:12px}
+  input[type=radio],input[type=checkbox]{transform:translateY(0.5px)}
+  select{background:var(--btn);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:3px 6px;font-size:12px}
+  button{background:var(--btn);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:7px 10px;cursor:pointer}
+  button:hover{background:var(--btn2)}
+  button.primary{background:rgba(34,197,94,.15);border-color:rgba(34,197,94,.35)}
+  button.primary:hover{background:rgba(34,197,94,.22)}
+  textarea{width:100%;height:300px;margin-top:10px;border-radius:12px;border:1px solid var(--border);background:var(--panel);color:var(--text);padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.35}
+  .status{margin-top:8px;color:var(--muted);font-size:12px;min-height:16px;display:flex;align-items:center;gap:8px}
+  .hint{margin-top:6px;color:var(--muted);font-size:11px}
+  .progress-bar{flex:1;height:4px;background:var(--btn);border-radius:2px;overflow:hidden}
+  .progress-fill{height:100%;background:var(--accent);transition:width .2s;width:0%}
+  .sep{width:1px;height:16px;background:var(--border)}
+</style>
+
+<div class="card">
+  <div class="row">
+    <label><input type="radio" name="scope" value="selection" checked> Selection</label>
+    <label><input type="radio" name="scope" value="page"> Whole page</label>
+    <span class="spacer"></span>
+    <button id="export" class="primary">Export</button>
+    <button id="copy">Copy</button>
+    <button id="download">Download</button>
+  </div>
+
+  <div class="row" style="margin-top:10px">
+    <label><input id="optChildren" type="checkbox" checked> Children</label>
+    <label><input id="optFills" type="checkbox" checked> Fills</label>
+    <label><input id="optStrokes" type="checkbox" checked> Strokes</label>
+    <label><input id="optRadius" type="checkbox" checked> Radius</label>
+    <label><input id="optEffects" type="checkbox" checked> Shadows/Blur</label>
+    <label><input id="optText" type="checkbox" checked> Text styles</label>
+  </div>
+
+  <div class="row" style="margin-top:6px">
+    <label title="Extract image fills as separate files. Download produces a ZIP."><input id="optEmbed" type="checkbox" checked> Extract images</label>
+    <label title="Export vector nodes (VECTOR, STAR, ELLIPSE, etc.) as inline SVG instead of rasterizing."><input id="optSvg" type="checkbox" checked> Vectors as SVG</label>
+    <label title="Rasterize instances/components as PNG for fidelity."><input id="optRasterIC" type="checkbox"> Rasterize instances</label>
+    <label title="Rasterize containers with clip/mask."><input id="optRasterClip" type="checkbox" checked> Rasterize clipped</label>
+    <label title="Extract repeated colors as CSS custom properties."><input id="optCssVars" type="checkbox"> CSS variables</label>
+    <span class="sep"></span>
+    <label>Format <select id="optImgFmt"><option value="PNG">PNG</option><option value="JPG">JPEG</option><option value="WEBP">WebP</option></select></label>
+    <label>Scale <select id="optImgScale"><option value="1">1x</option><option value="2">2x</option><option value="3">3x</option></select></label>
+  </div>
+
+  <div class="hint">Tip: Auto Layout frames export as flexbox. Use data-figma-* attributes for Compose conversion.</div>
+
+  <textarea id="output" placeholder="Exported HTML will appear here"></textarea>
+  <div class="status">
+    <span id="statusText"></span>
+    <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+  </div>
+</div>
+
+<script>
+  // ── Mini ZIP builder (STORE method, no compression) ──
+  function buildZip(files) {
+    const encoder = new TextEncoder();
+    const centralDir = [];
+    const parts = [];
+    let offset = 0;
+
+    for (const file of files) {
+      const nameBytes = encoder.encode(file.name);
+      const crc = crc32(file.data);
+      const size = file.data.length;
+
+      const local = new Uint8Array(30 + nameBytes.length + size);
+      const lv = new DataView(local.buffer);
+      lv.setUint32(0, 0x04034b50, true);
+      lv.setUint16(4, 20, true);
+      lv.setUint16(6, 0, true);
+      lv.setUint16(8, 0, true);
+      lv.setUint16(10, 0, true);
+      lv.setUint16(12, 0, true);
+      lv.setUint32(14, crc, true);
+      lv.setUint32(18, size, true);
+      lv.setUint32(22, size, true);
+      lv.setUint16(26, nameBytes.length, true);
+      lv.setUint16(28, 0, true);
+      local.set(nameBytes, 30);
+      local.set(file.data, 30 + nameBytes.length);
+      parts.push(local);
+
+      const central = new Uint8Array(46 + nameBytes.length);
+      const cv = new DataView(central.buffer);
+      cv.setUint32(0, 0x02014b50, true);
+      cv.setUint16(4, 20, true);
+      cv.setUint16(6, 20, true);
+      cv.setUint16(8, 0, true);
+      cv.setUint16(10, 0, true);
+      cv.setUint16(12, 0, true);
+      cv.setUint16(14, 0, true);
+      cv.setUint32(16, crc, true);
+      cv.setUint32(20, size, true);
+      cv.setUint32(24, size, true);
+      cv.setUint16(28, nameBytes.length, true);
+      cv.setUint16(30, 0, true);
+      cv.setUint16(32, 0, true);
+      cv.setUint16(34, 0, true);
+      cv.setUint16(36, 0, true);
+      cv.setUint32(38, 0, true);
+      cv.setUint32(42, offset, true);
+      central.set(nameBytes, 46);
+      centralDir.push(central);
+
+      offset += local.length;
+    }
+
+    let cdSize = 0;
+    for (const c of centralDir) cdSize += c.length;
+    const eocd = new Uint8Array(22);
+    const ev = new DataView(eocd.buffer);
+    ev.setUint32(0, 0x06054b50, true);
+    ev.setUint16(4, 0, true);
+    ev.setUint16(6, 0, true);
+    ev.setUint16(8, files.length, true);
+    ev.setUint16(10, files.length, true);
+    ev.setUint32(12, cdSize, true);
+    ev.setUint32(16, offset, true);
+    ev.setUint16(20, 0, true);
+
+    const totalSize = offset + cdSize + 22;
+    const out = new Uint8Array(totalSize);
+    let pos = 0;
+    for (const p of parts) { out.set(p, pos); pos += p.length; }
+    for (const c of centralDir) { out.set(c, pos); pos += c.length; }
+    out.set(eocd, pos);
+    return out;
+  }
+
+  const crc32Table = (() => {
+    const t = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[i] = c;
+    }
+    return t;
+  })();
+
+  function crc32(data) {
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < data.length; i++) crc = crc32Table[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  function base64ToUint8Array(b64) {
+    const bin = atob(b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+  }
+
+  // ── Plugin UI logic ──
+  const exportBtn = document.getElementById('export');
+  const copyBtn = document.getElementById('copy');
+  const downloadBtn = document.getElementById('download');
+  const output = document.getElementById('output');
+  const statusText = document.getElementById('statusText');
+  const progressFill = document.getElementById('progressFill');
+
+  let lastImages = [];
+  let lastFileName = 'figma-export';
+
+  function getOptions() {
+    return {
+      includeChildren: document.getElementById('optChildren').checked,
+      includeFills: document.getElementById('optFills').checked,
+      includeStrokes: document.getElementById('optStrokes').checked,
+      includeRadius: document.getElementById('optRadius').checked,
+      includeEffects: document.getElementById('optEffects').checked,
+      includeTextStyles: document.getElementById('optText').checked,
+      embedImages: document.getElementById('optEmbed').checked,
+      exportVectorsSvg: document.getElementById('optSvg').checked,
+      rasterizeInstancesComponents: document.getElementById('optRasterIC').checked,
+      rasterizeClippedMaskedContainers: document.getElementById('optRasterClip').checked,
+      extractCssVars: document.getElementById('optCssVars').checked,
+      imageFormat: document.getElementById('optImgFmt').value,
+      imageScale: parseInt(document.getElementById('optImgScale').value, 10)
+    };
+  }
+
+  exportBtn.onclick = () => {
+    const scope = document.querySelector('input[name=scope]:checked').value;
+    parent.postMessage({ pluginMessage: { type: 'export-html', scope, options: getOptions() } }, '*');
+    statusText.textContent = 'Starting...';
+    progressFill.style.width = '0%';
+  };
+
+  copyBtn.onclick = () => {
+    output.select();
+    document.execCommand('copy');
+    statusText.textContent = 'Copied to clipboard.';
+  };
+
+  downloadBtn.onclick = () => {
+    if (!output.value) return;
+
+    if (lastImages.length > 0) {
+      const encoder = new TextEncoder();
+      const htmlData = encoder.encode(output.value);
+      const files = [{ name: 'index.html', data: htmlData }];
+      for (const img of lastImages) {
+        files.push({ name: img.name, data: base64ToUint8Array(img.base64) });
+      }
+      const zip = buildZip(files);
+      const blob = new Blob([zip], { type: 'application/zip' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = lastFileName + '.zip';
+      a.click();
+      URL.revokeObjectURL(url);
+      statusText.textContent = `Downloaded ${lastFileName}.zip (${lastImages.length} image${lastImages.length > 1 ? 's' : ''}).`;
+    } else {
+      const blob = new Blob([output.value], { type: 'text/html' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = lastFileName + '.html';
+      a.click();
+      URL.revokeObjectURL(url);
+      statusText.textContent = `Downloaded ${lastFileName}.html`;
+    }
+  };
+
+  onmessage = (e) => {
+    const msg = e.data.pluginMessage;
+    if (!msg) return;
+
+    if (msg.type === 'html-result') {
+      output.value = msg.html;
+      lastImages = msg.images || [];
+      lastFileName = msg.fileName || 'figma-export';
+      downloadBtn.textContent = lastImages.length > 0
+        ? `Download .zip (${lastImages.length} img)`
+        : 'Download .html';
+      statusText.textContent = 'Done';
+      progressFill.style.width = '100%';
+    }
+
+    if (msg.type === 'export-progress') {
+      const pct = msg.total > 0 ? Math.round((msg.current / msg.total) * 100) : 0;
+      progressFill.style.width = pct + '%';
+      statusText.textContent = `${msg.current}/${msg.total} nodes...`;
+    }
+
+    if (msg.type === 'export-status') {
+      statusText.textContent = msg.status || '';
+    }
+  };
+</script>
