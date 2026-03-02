@@ -1,21 +1,115 @@
-# HTML → Jetpack Compose 변환 가이드
+# Figma → Jetpack Compose 변환 가이드
 
-이 문서는 Figma Exporter 플러그인이 출력한 HTML을 Android Jetpack Compose 코드로 변환하기 위한 가이드입니다.
+이 문서는 Figma to Code 플러그인의 Compose 코드 생성에 대한 기술 가이드입니다.
+플러그인은 Figma 디자인을 직접 Jetpack Compose 코드로 변환하거나, HTML 중간 출력을 통해 수동 변환할 수 있습니다.
 
 ## 목차
 
-1. [프로젝트 셋업](#1-프로젝트-셋업)
-2. [HTML 구조 이해](#2-html-구조-이해)
-3. [레이아웃 매핑](#3-레이아웃-매핑)
-4. [스타일 매핑](#4-스타일-매핑)
-5. [텍스트 매핑](#5-텍스트-매핑)
-6. [이미지 매핑](#6-이미지-매핑)
-7. [data-figma-* 속성 파싱](#7-data-figma--속성-파싱)
-8. [완성 예시](#8-완성-예시)
+1. [변환 설계 결정사항](#1-변환-설계-결정사항)
+2. [알려진 제한사항 및 리스크](#2-알려진-제한사항-및-리스크)
+3. [프로젝트 셋업](#3-프로젝트-셋업)
+4. [HTML 구조 이해](#4-html-구조-이해)
+5. [레이아웃 매핑](#5-레이아웃-매핑)
+6. [스타일 매핑](#6-스타일-매핑)
+7. [텍스트 매핑](#7-텍스트-매핑)
+8. [이미지 매핑](#8-이미지-매핑)
+9. [data-figma-* 속성 파싱](#9-data-figma--속성-파싱)
+10. [완성 예시](#10-완성-예시)
 
 ---
 
-## 1. 프로젝트 셋업
+## 1. 변환 설계 결정사항
+
+| 항목 | 결정 | 근거 |
+|------|------|------|
+| **Material 버전** | Material 3 | 최신 Android 프로젝트 표준. `MaterialTheme.colorScheme` 사용 |
+| **출력 형식** | @Composable 함수 + 파일 구조(ZIP) 둘 다 지원 | 단일 함수는 빠른 복사용, 파일 구조는 프로젝트 통합용 |
+| **컴포넌트 분리** | Figma COMPONENT/INSTANCE → 별도 @Composable fun | 재사용 가능한 코드 생성 |
+| **이미지 참조** | `painterResource(R.drawable.img_001)` | 로컬 리소스 기반. ZIP에 drawable 포함 |
+| **단위 변환** | 1px = 1dp (1:1) | Figma의 px을 그대로 dp로 매핑. 업계 표준 |
+| **HTML 출력** | 병행 지원 | UI에서 HTML/Compose 탭 전환 |
+
+### 파일 구조 모드 출력
+
+```
+compose-export.zip
+├── ui/
+│   ├── Screen.kt              ← 메인 @Composable
+│   ├── components/
+│   │   ├── CardComponent.kt   ← Figma COMPONENT별 분리
+│   │   └── ButtonPrimary.kt
+│   └── theme/
+│       ├── Color.kt           ← 추출된 색상 상수
+│       └── Type.kt            ← 추출된 텍스트 스타일
+└── res/
+    └── drawable/
+        ├── img_001.png
+        └── img_002.png
+```
+
+---
+
+## 2. 알려진 제한사항 및 리스크
+
+### 높은 리스크
+
+**레이아웃 매핑 한계**
+- Figma에서 Auto Layout 없이 absolute로 배치된 요소는 `Box + Modifier.offset()`으로 변환됩니다. 이는 **다른 화면 크기에서 깨질 수 있습니다.**
+- Figma의 Constraints(좌측 고정, 우측 고정 등)를 Compose의 `fillMaxWidth`, `wrapContentSize` 등으로 정확히 매핑하기 어렵습니다.
+- **권장**: Auto Layout을 사용한 프레임 위주로 디자인하면 변환 품질이 크게 향상됩니다.
+
+**중첩 레이아웃 성능**
+- Figma는 수십 레벨 중첩이 흔한데, 그대로 Row/Column/Box로 변환하면 Compose recomposition 성능 문제가 발생할 수 있습니다.
+- 생성된 코드를 검토하여 불필요한 래핑을 제거하는 것을 권장합니다.
+
+**텍스트 스타일 정밀도**
+- Mixed text(`getStyledTextSegments`)를 `AnnotatedString`으로 변환하지만, line-height, letter-spacing 등이 미세하게 다를 수 있습니다.
+- Figma의 line-height는 행 중앙 기준, Compose는 행 위 기준이라 수직 정렬에 차이가 생깁니다.
+
+### 중간 리스크
+
+**폰트 가용성**
+- Figma에서 사용한 폰트(Inter, Pretendard 등)가 Android 프로젝트에 없을 수 있습니다. `res/font/`에 폰트 파일을 추가하거나, 생성된 코드에서 `FontFamily.Default`로 fallback됩니다.
+
+**Shadow/Blur Compose 제한**
+- CSS `box-shadow`는 Compose에 직접 대응이 없습니다. `elevation`은 근사치이며, 정확한 재현은 커스텀 `drawBehind`가 필요합니다.
+- `backdrop-filter: blur()`는 API 31+(Android 12) 이상에서만 사용 가능합니다.
+- Inner shadow는 Compose에 내장 지원이 없어 커스텀 구현이 필요합니다.
+- 변환 불가능한 효과는 `// TODO:` 코멘트로 표시됩니다.
+
+**Gradient 정밀도**
+- Figma의 `gradientTransform` (2x3 매트릭스)를 Compose의 `Brush.linearGradient(start, end)`로 정확히 변환하기 어렵습니다.
+- 단순 각도(0/90/180/270)는 정확하지만, 비정형 각도는 근사치가 됩니다.
+
+**컴포넌트 이름 충돌**
+- Figma에서 "Button", "Card" 같은 이름이 Compose 기본 컴포넌트와 충돌할 수 있습니다.
+- 같은 이름의 컴포넌트가 여러 개 있을 경우 넘버링으로 구분됩니다.
+
+### 낮은 리스크
+
+**이미지 해상도**
+- 1x로 추출하면 고해상도 디바이스에서 흐릿해질 수 있습니다. 2x 또는 3x 스케일 추출을 권장합니다.
+- SVG 벡터는 `VectorDrawable`로 수동 변환이 필요합니다.
+
+**postMessage 크기**
+- 매우 많은 노드 + 이미지가 있으면 Figma 플러그인의 메시지 크기 제한에 걸릴 수 있습니다.
+
+**생성 코드 가독성**
+- 자동 생성 코드는 수동 작성보다 가독성이 떨어질 수 있습니다. Figma 레이어 이름이 코멘트로 추가되어 구조 파악을 돕습니다.
+
+### 변환 정확도 기대치
+
+이 플러그인은 **Pixel-perfect 변환이 아닌, 80% 수준의 작업 시작점**을 제공합니다. 생성된 코드를 기반으로 수동 조정이 필요합니다:
+
+- Auto Layout 프레임 → Row/Column: **높은 정확도**
+- Absolute 배치 → Box + offset: **중간 정확도** (화면 크기 대응 필요)
+- 색상/크기/패딩: **높은 정확도**
+- Shadow/Blur 효과: **낮은 정확도** (수동 구현 필요)
+- 복잡한 마스크/클리핑: **래스터라이즈 fallback**
+
+---
+
+## 3. 프로젝트 셋업
 
 ### build.gradle.kts (app)
 
@@ -48,7 +142,7 @@ images/img-002.png → app/src/main/res/drawable/img_002.png
 
 ---
 
-## 2. HTML 구조 이해
+## 4. HTML 구조 이해
 
 ### data-figma-* 속성
 
@@ -77,7 +171,7 @@ images/img-002.png → app/src/main/res/drawable/img_002.png
 
 ---
 
-## 3. 레이아웃 매핑
+## 5. 레이아웃 매핑
 
 ### Auto Layout → Row / Column
 
@@ -154,7 +248,7 @@ Box(modifier = Modifier.weight(1f).height(40.dp))
 
 ---
 
-## 4. 스타일 매핑
+## 6. 스타일 매핑
 
 ### 배경색
 
@@ -338,7 +432,7 @@ Modifier.clip(RoundedCornerShape(12.dp))
 
 ---
 
-## 5. 텍스트 매핑
+## 7. 텍스트 매핑
 
 ### 기본 텍스트
 
@@ -417,7 +511,7 @@ Text(
 
 ---
 
-## 6. 이미지 매핑
+## 8. 이미지 매핑
 
 ### 로컬 리소스
 
@@ -461,7 +555,7 @@ Image(
 
 ---
 
-## 7. data-figma-* 속성 파싱
+## 9. data-figma-* 속성 파싱
 
 HTML을 프로그래밍적으로 파싱하여 Compose 코드를 생성할 수 있습니다. 다음은 Kotlin 예제입니다.
 
@@ -557,7 +651,7 @@ for (element in elements) {
 
 ---
 
-## 8. 완성 예시
+## 10. 완성 예시
 
 ### 입력: 카드 컴포넌트 HTML
 

@@ -10,6 +10,7 @@
     --btn:#1f2937;
     --btn2:#111827;
     --accent:#22c55e;
+    --tab-active:rgba(34,197,94,.18);
   }
   *{box-sizing:border-box}
   body{margin:12px;font-family:Inter,Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}
@@ -23,15 +24,29 @@
   button:hover{background:var(--btn2)}
   button.primary{background:rgba(34,197,94,.15);border-color:rgba(34,197,94,.35)}
   button.primary:hover{background:rgba(34,197,94,.22)}
-  textarea{width:100%;height:300px;margin-top:10px;border-radius:12px;border:1px solid var(--border);background:var(--panel);color:var(--text);padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.35}
+  textarea{width:100%;height:280px;margin-top:10px;border-radius:12px;border:1px solid var(--border);background:var(--panel);color:var(--text);padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.35}
   .status{margin-top:8px;color:var(--muted);font-size:12px;min-height:16px;display:flex;align-items:center;gap:8px}
   .hint{margin-top:6px;color:var(--muted);font-size:11px}
   .progress-bar{flex:1;height:4px;background:var(--btn);border-radius:2px;overflow:hidden}
   .progress-fill{height:100%;background:var(--accent);transition:width .2s;width:0%}
   .sep{width:1px;height:16px;background:var(--border)}
+
+  /* Tabs */
+  .tabs{display:flex;gap:0;margin-bottom:10px;border-bottom:1px solid var(--border)}
+  .tab{padding:8px 16px;cursor:pointer;font-size:13px;font-weight:500;color:var(--muted);border:none;background:none;border-bottom:2px solid transparent;transition:all .15s}
+  .tab:hover{color:var(--text)}
+  .tab.active{color:var(--accent);border-bottom-color:var(--accent);background:var(--tab-active);border-radius:6px 6px 0 0}
+  .opts-section{margin-top:8px}
+  .hidden{display:none!important}
 </style>
 
 <div class="card">
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab active" data-tab="html">HTML</button>
+    <button class="tab" data-tab="compose">Compose</button>
+  </div>
+
   <div class="row">
     <label><input type="radio" name="scope" value="selection" checked> Selection</label>
     <label><input type="radio" name="scope" value="page"> Whole page</label>
@@ -41,6 +56,7 @@
     <button id="download">Download</button>
   </div>
 
+  <!-- Common options -->
   <div class="row" style="margin-top:10px">
     <label><input id="optChildren" type="checkbox" checked> Children</label>
     <label><input id="optFills" type="checkbox" checked> Fills</label>
@@ -50,10 +66,11 @@
     <label><input id="optText" type="checkbox" checked> Text styles</label>
   </div>
 
-  <div class="row" style="margin-top:6px">
-    <label title="Extract image fills as separate files. Download produces a ZIP."><input id="optEmbed" type="checkbox" checked> Extract images</label>
-    <label title="Export vector nodes (VECTOR, STAR, ELLIPSE, etc.) as inline SVG instead of rasterizing."><input id="optSvg" type="checkbox" checked> Vectors as SVG</label>
-    <label title="Rasterize instances/components as PNG for fidelity."><input id="optRasterIC" type="checkbox"> Rasterize instances</label>
+  <!-- HTML-only options -->
+  <div id="htmlOpts" class="row opts-section">
+    <label title="Extract image fills as separate files."><input id="optEmbed" type="checkbox" checked> Extract images</label>
+    <label title="Export vector nodes as inline SVG."><input id="optSvg" type="checkbox" checked> Vectors as SVG</label>
+    <label title="Rasterize instances/components as PNG."><input id="optRasterIC" type="checkbox"> Rasterize instances</label>
     <label title="Rasterize containers with clip/mask."><input id="optRasterClip" type="checkbox" checked> Rasterize clipped</label>
     <label title="Extract repeated colors as CSS custom properties."><input id="optCssVars" type="checkbox"> CSS variables</label>
     <span class="sep"></span>
@@ -61,9 +78,19 @@
     <label>Scale <select id="optImgScale"><option value="1">1x</option><option value="2">2x</option><option value="3">3x</option></select></label>
   </div>
 
-  <div class="hint">Tip: Auto Layout frames export as flexbox. Use data-figma-* attributes for Compose conversion.</div>
+  <!-- Compose-only options -->
+  <div id="composeOpts" class="row opts-section hidden">
+    <label title="Single @Composable function output"><input type="radio" name="composeFormat" value="single" checked> Single function</label>
+    <label title="File structure (Screen.kt + components/ + theme/)"><input type="radio" name="composeFormat" value="files"> File structure (ZIP)</label>
+    <span class="sep"></span>
+    <label title="Extract images as drawable resources."><input id="optComposeImg" type="checkbox" checked> Extract images</label>
+    <label>Scale <select id="optComposeScale"><option value="1">1x</option><option value="2">2x</option><option value="3">3x</option></select></label>
+  </div>
 
-  <textarea id="output" placeholder="Exported HTML will appear here"></textarea>
+  <div id="hintHtml" class="hint">Tip: Auto Layout frames export as flexbox. Use data-figma-* attributes for Compose conversion.</div>
+  <div id="hintCompose" class="hint hidden">Tip: Auto Layout frames map to Row/Column. Components are extracted as separate @Composable functions.</div>
+
+  <textarea id="output" placeholder="Exported code will appear here"></textarea>
   <div class="status">
     <span id="statusText"></span>
     <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
@@ -170,6 +197,32 @@
     return arr;
   }
 
+  // ── Tab switching ──
+  let currentTab = 'html';
+  const tabs = document.querySelectorAll('.tab');
+  const htmlOpts = document.getElementById('htmlOpts');
+  const composeOpts = document.getElementById('composeOpts');
+  const hintHtml = document.getElementById('hintHtml');
+  const hintCompose = document.getElementById('hintCompose');
+
+  tabs.forEach(tab => {
+    tab.onclick = () => {
+      tabs.forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      currentTab = tab.dataset.tab;
+
+      htmlOpts.classList.toggle('hidden', currentTab !== 'html');
+      composeOpts.classList.toggle('hidden', currentTab !== 'compose');
+      hintHtml.classList.toggle('hidden', currentTab !== 'html');
+      hintCompose.classList.toggle('hidden', currentTab !== 'compose');
+
+      output.value = '';
+      statusText.textContent = '';
+      progressFill.style.width = '0%';
+      downloadBtn.textContent = 'Download';
+    };
+  });
+
   // ── Plugin UI logic ──
   const exportBtn = document.getElementById('export');
   const copyBtn = document.getElementById('copy');
@@ -180,6 +233,7 @@
 
   let lastImages = [];
   let lastFileName = 'figma-export';
+  let lastComposeFiles = null;
 
   function getOptions() {
     return {
@@ -189,19 +243,28 @@
       includeRadius: document.getElementById('optRadius').checked,
       includeEffects: document.getElementById('optEffects').checked,
       includeTextStyles: document.getElementById('optText').checked,
-      embedImages: document.getElementById('optEmbed').checked,
+      embedImages: currentTab === 'html'
+        ? document.getElementById('optEmbed').checked
+        : document.getElementById('optComposeImg').checked,
       exportVectorsSvg: document.getElementById('optSvg').checked,
       rasterizeInstancesComponents: document.getElementById('optRasterIC').checked,
       rasterizeClippedMaskedContainers: document.getElementById('optRasterClip').checked,
       extractCssVars: document.getElementById('optCssVars').checked,
       imageFormat: document.getElementById('optImgFmt').value,
-      imageScale: parseInt(document.getElementById('optImgScale').value, 10)
+      imageScale: currentTab === 'html'
+        ? parseInt(document.getElementById('optImgScale').value, 10)
+        : parseInt(document.getElementById('optComposeScale').value, 10)
     };
   }
 
   exportBtn.onclick = () => {
     const scope = document.querySelector('input[name=scope]:checked').value;
-    parent.postMessage({ pluginMessage: { type: 'export-html', scope, options: getOptions() } }, '*');
+    if (currentTab === 'compose') {
+      const composeFormat = document.querySelector('input[name=composeFormat]:checked').value;
+      parent.postMessage({ pluginMessage: { type: 'export-compose', scope, options: getOptions(), composeFormat } }, '*');
+    } else {
+      parent.postMessage({ pluginMessage: { type: 'export-html', scope, options: getOptions() } }, '*');
+    }
     statusText.textContent = 'Starting...';
     progressFill.style.width = '0%';
   };
@@ -215,10 +278,23 @@
   downloadBtn.onclick = () => {
     if (!output.value) return;
 
-    if (lastImages.length > 0) {
+    // Compose file structure mode
+    if (currentTab === 'compose' && lastComposeFiles) {
       const encoder = new TextEncoder();
-      const htmlData = encoder.encode(output.value);
-      const files = [{ name: 'index.html', data: htmlData }];
+      const files = [];
+      // Screen.kt
+      files.push({ name: 'ui/Screen.kt', data: encoder.encode(lastComposeFiles.screenKt) });
+      // Components
+      if (lastComposeFiles.componentFiles) {
+        for (const [name, code] of Object.entries(lastComposeFiles.componentFiles)) {
+          files.push({ name: 'ui/components/' + name + '.kt', data: encoder.encode(code) });
+        }
+      }
+      // Color.kt
+      if (lastComposeFiles.colorKt) {
+        files.push({ name: 'ui/theme/Color.kt', data: encoder.encode(lastComposeFiles.colorKt) });
+      }
+      // Images
       for (const img of lastImages) {
         files.push({ name: img.name, data: base64ToUint8Array(img.base64) });
       }
@@ -226,18 +302,41 @@
       const blob = new Blob([zip], { type: 'application/zip' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
+      a.href = url; a.download = lastFileName + '-compose.zip';
+      a.click();
+      URL.revokeObjectURL(url);
+      statusText.textContent = `Downloaded ${lastFileName}-compose.zip`;
+      return;
+    }
+
+    // Compose single mode or HTML with images
+    if (lastImages.length > 0) {
+      const encoder = new TextEncoder();
+      const ext = currentTab === 'compose' ? 'kt' : 'html';
+      const mainName = currentTab === 'compose' ? 'Screen.kt' : 'index.html';
+      const mainData = encoder.encode(output.value);
+      const zipFiles = [{ name: mainName, data: mainData }];
+      for (const img of lastImages) {
+        zipFiles.push({ name: img.name, data: base64ToUint8Array(img.base64) });
+      }
+      const zip = buildZip(zipFiles);
+      const blob = new Blob([zip], { type: 'application/zip' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
       a.href = url; a.download = lastFileName + '.zip';
       a.click();
       URL.revokeObjectURL(url);
-      statusText.textContent = `Downloaded ${lastFileName}.zip (${lastImages.length} image${lastImages.length > 1 ? 's' : ''}).`;
+      statusText.textContent = `Downloaded ${lastFileName}.zip`;
     } else {
-      const blob = new Blob([output.value], { type: 'text/html' });
+      const ext = currentTab === 'compose' ? 'kt' : 'html';
+      const mime = currentTab === 'compose' ? 'text/plain' : 'text/html';
+      const blob = new Blob([output.value], { type: mime });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url; a.download = lastFileName + '.html';
+      a.href = url; a.download = lastFileName + '.' + ext;
       a.click();
       URL.revokeObjectURL(url);
-      statusText.textContent = `Downloaded ${lastFileName}.html`;
+      statusText.textContent = `Downloaded ${lastFileName}.${ext}`;
     }
   };
 
@@ -249,9 +348,27 @@
       output.value = msg.html;
       lastImages = msg.images || [];
       lastFileName = msg.fileName || 'figma-export';
+      lastComposeFiles = null;
       downloadBtn.textContent = lastImages.length > 0
         ? `Download .zip (${lastImages.length} img)`
         : 'Download .html';
+      statusText.textContent = 'Done';
+      progressFill.style.width = '100%';
+    }
+
+    if (msg.type === 'compose-result') {
+      output.value = msg.code;
+      lastImages = msg.images || [];
+      lastFileName = msg.fileName || 'figma-export';
+      lastComposeFiles = msg.format === 'files' ? msg.files : null;
+      if (msg.format === 'files') {
+        const compCount = msg.files && msg.files.componentFiles ? Object.keys(msg.files.componentFiles).length : 0;
+        downloadBtn.textContent = `Download .zip (${compCount} components)`;
+      } else {
+        downloadBtn.textContent = lastImages.length > 0
+          ? `Download .zip (${lastImages.length} img)`
+          : 'Download .kt';
+      }
       statusText.textContent = 'Done';
       progressFill.style.width = '100%';
     }

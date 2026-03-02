@@ -8,6 +8,11 @@ figma.showUI(__html__, { width: 760, height: 580 });
 // ── Main handler ──
 
 figma.ui.onmessage = async (msg) => {
+  if (msg.type === 'export-compose') {
+    await handleExportCompose(msg);
+    return;
+  }
+
   if (msg.type !== 'export-html') return;
 
   const scope = msg.scope || 'selection';
@@ -806,4 +811,686 @@ function extractCssVariables(html) {
   // Inject :root block into <style>
   result = result.replace('<style>', `<style>\n${rootBlock}`);
   return result;
+}
+
+// ══════════════════════════════════════════════════════════════
+// ══  Compose Export Engine                                  ══
+// ══════════════════════════════════════════════════════════════
+
+async function handleExportCompose(msg) {
+  const scope = msg.scope || 'selection';
+  const options = normalizeOptions(msg.options);
+  const composeFormat = msg.composeFormat || 'single'; // 'single' | 'files'
+
+  const imageAssets = [];
+  let imageCounter = 0;
+  const imgExt = { PNG: '.png', JPG: '.jpg', JPEG: '.jpg', WEBP: '.webp' };
+  function collectImage(base64) {
+    imageCounter++;
+    const ext = imgExt[options.imageFormat] || '.png';
+    const name = 'img_' + String(imageCounter).padStart(3, '0');
+    imageAssets.push({ name: 'res/drawable/' + name + ext, base64, resName: name });
+    return name;
+  }
+
+  let roots = [];
+  if (scope === 'selection' && figma.currentPage.selection.length) {
+    roots = figma.currentPage.selection;
+  } else {
+    roots = figma.currentPage.children;
+  }
+
+  const totalNodes = roots.reduce((sum, r) => sum + countNodes(r), 0);
+  let processedNodes = 0;
+  function onProgress() {
+    processedNodes++;
+    if (processedNodes % 5 === 0 || processedNodes === totalNodes) {
+      figma.ui.postMessage({ type: 'export-progress', current: processedNodes, total: totalNodes });
+    }
+  }
+
+  figma.ui.postMessage({ type: 'export-progress', current: 0, total: totalNodes });
+
+  const components = new Map(); // name → kotlin code
+  const colorSet = new Map(); // rgba string → variable name
+  let colorIdx = 0;
+
+  const bodyParts = [];
+  for (const root of roots) {
+    const code = await serializeCompose(root, 1, options, components, collectImage, false, onProgress, colorSet, () => colorIdx++);
+    if (code) bodyParts.push(code);
+  }
+
+  const screenName = roots.length === 1 ? composeFunName(roots[0].name || 'Screen') : 'ExportedScreen';
+  const fileName = (roots.length === 1 && roots[0].name) ? sanitizeFileName(roots[0].name) : 'figma-export';
+
+  if (composeFormat === 'files') {
+    const files = buildComposeFileStructure(screenName, bodyParts.join('\n'), components, colorSet, imageAssets);
+    figma.ui.postMessage({ type: 'compose-result', code: files.mainCode, files, images: imageAssets, fileName, format: 'files' });
+  } else {
+    const code = buildComposeSingleOutput(screenName, bodyParts.join('\n'), components, colorSet);
+    figma.ui.postMessage({ type: 'compose-result', code, images: imageAssets, fileName, format: 'single' });
+  }
+
+  figma.ui.postMessage({ type: 'export-progress', current: totalNodes, total: totalNodes });
+}
+
+// ── Main Compose serializer ──
+
+async function serializeCompose(node, indent, options, components, collectImage, parentIsAL, onProgress, colorSet, nextColorIdx) {
+  if (!node || node.visible === false) return null;
+  if (onProgress) onProgress();
+
+  if (node.type === 'TEXT') {
+    try { await figma.loadFontAsync(node.fontName); } catch (e) {}
+  }
+
+  const box = getAbsBox(node);
+  if (!box) return null;
+  const pad = '    '.repeat(indent);
+  const width = Math.round(box.width);
+  const height = Math.round(box.height);
+
+  // Component/Instance extraction
+  if ((node.type === 'COMPONENT' || node.type === 'INSTANCE') && node.name) {
+    const funName = composeFunName(node.name);
+    if (!components.has(funName)) {
+      const inner = await serializeComposeInner(node, 1, options, components, collectImage, false, onProgress, colorSet, nextColorIdx);
+      components.set(funName, inner || '    // empty');
+    }
+    return `${pad}${funName}()`;
+  }
+
+  return await serializeComposeInner(node, indent, options, components, collectImage, parentIsAL, onProgress, colorSet, nextColorIdx);
+}
+
+async function serializeComposeInner(node, indent, options, components, collectImage, parentIsAL, onProgress, colorSet, nextColorIdx) {
+  const box = getAbsBox(node);
+  if (!box) return null;
+  const pad = '    '.repeat(indent);
+  const width = Math.round(box.width);
+  const height = Math.round(box.height);
+  const isAL = node.layoutMode && node.layoutMode !== 'NONE';
+
+  // TEXT node
+  if (node.type === 'TEXT') {
+    return composeText(node, indent, options, colorSet, nextColorIdx);
+  }
+
+  // Image fill
+  if (options.embedImages && hasImageFill(node)) {
+    try {
+      figma.ui.postMessage({ type: 'export-status', status: `Image: ${node.name || node.type}` });
+      const bytes = await node.exportAsync(buildExportSettings(options));
+      const b64 = figma.base64Encode(bytes);
+      const resName = collectImage(b64);
+      return composeImage(resName, node.name, width, height, indent);
+    } catch (e) {}
+  }
+
+  // SVG vector
+  if (options.exportVectorsSvg && isVectorNode(node)) {
+    try {
+      const bytes = await node.exportAsync(buildExportSettings(options));
+      const b64 = figma.base64Encode(bytes);
+      const resName = collectImage(b64);
+      return composeImage(resName, node.name, width, height, indent);
+    } catch (e) {}
+  }
+
+  // Rasterize instances
+  if (options.rasterizeInstancesComponents && isRasterizeCandidate(node)) {
+    try {
+      const bytes = await node.exportAsync(buildExportSettings(options));
+      const b64 = figma.base64Encode(bytes);
+      const resName = collectImage(b64);
+      return composeImage(resName, node.name, width, height, indent);
+    } catch (e) {}
+  }
+
+  // Rasterize clipped
+  if (options.rasterizeClippedMaskedContainers && isClippingContainer(node)) {
+    try {
+      const bytes = await node.exportAsync(buildExportSettings(options));
+      const b64 = figma.base64Encode(bytes);
+      const resName = collectImage(b64);
+      return composeImage(resName, node.name, width, height, indent);
+    } catch (e) {}
+  }
+
+  // Build modifier chain
+  const mods = composeModifiers(node, parentIsAL, options, width, height, colorSet, nextColorIdx);
+  const children = options.includeChildren ? getChildren(node) : [];
+
+  // Determine layout composable
+  if (isAL) {
+    const layoutInfo = composeAutoLayout(node, indent, mods, colorSet, nextColorIdx);
+    if (!children.length) {
+      return `${pad}${layoutInfo.open} {}`;
+    }
+    const inner = [];
+    for (const child of children) {
+      if (!child || child.visible === false) continue;
+      const c = await serializeCompose(child, indent + 1, options, components, collectImage, true, onProgress, colorSet, nextColorIdx);
+      if (c) inner.push(c);
+    }
+    const comment = node.name ? `${pad}// ${node.name}` : '';
+    return (comment ? comment + '\n' : '') +
+      `${pad}${layoutInfo.open} {\n${inner.join('\n')}\n${pad}}`;
+  }
+
+  // Box (no auto layout)
+  if (!children.length) {
+    const comment = node.name ? ` // ${node.name}` : '';
+    return `${pad}Box(modifier = ${mods || 'Modifier'})${comment}`;
+  }
+
+  const inner = [];
+  for (const child of children) {
+    if (!child || child.visible === false) continue;
+    const c = await serializeCompose(child, indent + 1, options, components, collectImage, false, onProgress, colorSet, nextColorIdx);
+    if (c) inner.push(c);
+  }
+  const comment = node.name ? `${pad}// ${node.name}` : '';
+  return (comment ? comment + '\n' : '') +
+    `${pad}Box(modifier = ${mods || 'Modifier'}) {\n${inner.join('\n')}\n${pad}}`;
+}
+
+// ── Compose helpers ──
+
+function composeModifiers(node, parentIsAL, options, w, h, colorSet, nextColorIdx) {
+  const parts = [];
+
+  // Size
+  if (node.layoutGrow === 1 && parentIsAL) {
+    const parentDir = node.parent && node.parent.layoutMode;
+    if (parentDir === 'HORIZONTAL') {
+      parts.push(`.weight(1f).height(${h}.dp)`);
+    } else if (parentDir === 'VERTICAL') {
+      parts.push(`.width(${w}.dp).weight(1f)`);
+    } else {
+      parts.push(`.size(width = ${w}.dp, height = ${h}.dp)`);
+    }
+  } else if (node.layoutAlign === 'STRETCH' && parentIsAL) {
+    const parentDir = node.parent && node.parent.layoutMode;
+    if (parentDir === 'HORIZONTAL') {
+      parts.push(`.width(${w}.dp).fillMaxHeight()`);
+    } else {
+      parts.push(`.fillMaxWidth().height(${h}.dp)`);
+    }
+  } else {
+    parts.push(`.size(width = ${w}.dp, height = ${h}.dp)`);
+  }
+
+  // Offset for absolute positioning
+  if (!parentIsAL && node.parent) {
+    const parentBox = getAbsBox(node.parent);
+    const box = getAbsBox(node);
+    if (parentBox && box) {
+      const ox = Math.round(box.x - parentBox.x);
+      const oy = Math.round(box.y - parentBox.y);
+      if (ox !== 0 || oy !== 0) {
+        parts.push(`.offset(x = ${ox}.dp, y = ${oy}.dp)`);
+      }
+    }
+  }
+
+  // Background
+  if (options.includeFills) {
+    const bg = composeFills(node, colorSet, nextColorIdx);
+    if (bg) parts.push(bg);
+  }
+
+  // Border radius + clip
+  if (options.includeRadius) {
+    const shape = composeRadius(node);
+    if (shape) parts.push(`.clip(${shape})`);
+  }
+
+  // Border
+  if (options.includeStrokes) {
+    const border = composeStrokes(node, colorSet, nextColorIdx);
+    if (border) parts.push(border);
+  }
+
+  // Effects (shadow)
+  if (options.includeEffects) {
+    const fx = composeEffects(node);
+    if (fx) parts.push(fx);
+  }
+
+  // Opacity
+  if (typeof node.opacity === 'number' && node.opacity < 1) {
+    parts.push(`.alpha(${numF(node.opacity)}f)`);
+  }
+
+  // Clip content
+  if (node.clipsContent && options.includeRadius) {
+    const shape = composeRadius(node);
+    if (shape && !parts.some(p => p.includes('.clip('))) {
+      parts.push(`.clip(${shape})`);
+    }
+  }
+
+  if (!parts.length) return 'Modifier';
+  return 'Modifier\n' + parts.map(p => '            ' + p).join('\n');
+}
+
+function composeAutoLayout(node, indent, modStr, colorSet, nextColorIdx) {
+  const pad = '    '.repeat(indent);
+  const isH = node.layoutMode === 'HORIZONTAL';
+  const gap = node.itemSpacing || 0;
+  const pt = node.paddingTop || 0;
+  const pr = node.paddingRight || 0;
+  const pb = node.paddingBottom || 0;
+  const pl = node.paddingLeft || 0;
+
+  // Padding modifier
+  let padMod = '';
+  if (pt === pb && pl === pr && pt === pl && pt > 0) {
+    padMod = `.padding(${pt}.dp)`;
+  } else if (pt === pb && pl === pr) {
+    const parts = [];
+    if (pt > 0) parts.push(`vertical = ${pt}.dp`);
+    if (pl > 0) parts.push(`horizontal = ${pl}.dp`);
+    if (parts.length) padMod = `.padding(${parts.join(', ')})`;
+  } else {
+    const parts = [];
+    if (pt > 0) parts.push(`top = ${pt}.dp`);
+    if (pr > 0) parts.push(`end = ${pr}.dp`);
+    if (pb > 0) parts.push(`bottom = ${pb}.dp`);
+    if (pl > 0) parts.push(`start = ${pl}.dp`);
+    if (parts.length) padMod = `.padding(${parts.join(', ')})`;
+  }
+
+  const fullMod = modStr + (padMod ? '\n            ' + padMod : '');
+
+  // Arrangement
+  const arrangement = gap > 0
+    ? `Arrangement.spacedBy(${gap}.dp)`
+    : composeArrangement(node, isH);
+
+  // Alignment
+  const alignment = composeAlignment(node, isH);
+
+  const composable = isH ? 'Row' : 'Column';
+  const arrangeProp = isH ? 'horizontalArrangement' : 'verticalArrangement';
+  const alignProp = isH ? 'verticalAlignment' : 'horizontalAlignment';
+
+  let params = `modifier = ${fullMod}`;
+  if (arrangement) params += `,\n${pad}    ${arrangeProp} = ${arrangement}`;
+  if (alignment) params += `,\n${pad}    ${alignProp} = ${alignment}`;
+
+  return {
+    open: `${composable}(\n${pad}    ${params}\n${pad})`
+  };
+}
+
+function composeArrangement(node, isH) {
+  const primary = node.primaryAxisAlignItems;
+  if (!primary) return null;
+  const map = {
+    MIN: isH ? 'Arrangement.Start' : 'Arrangement.Top',
+    CENTER: 'Arrangement.Center',
+    MAX: isH ? 'Arrangement.End' : 'Arrangement.Bottom',
+    SPACE_BETWEEN: 'Arrangement.SpaceBetween'
+  };
+  return map[primary] || null;
+}
+
+function composeAlignment(node, isH) {
+  const counter = node.counterAxisAlignItems;
+  if (!counter) return null;
+  if (isH) {
+    const map = { MIN: 'Alignment.Top', CENTER: 'Alignment.CenterVertically', MAX: 'Alignment.Bottom' };
+    return map[counter] || null;
+  } else {
+    const map = { MIN: 'Alignment.Start', CENTER: 'Alignment.CenterHorizontally', MAX: 'Alignment.End' };
+    return map[counter] || null;
+  }
+}
+
+function composeFills(node, colorSet, nextColorIdx) {
+  if (!node || !node.fills || !Array.isArray(node.fills)) return null;
+  const fills = node.fills.filter(f => f && f.visible !== false);
+  if (!fills.length) return null;
+
+  const f = fills[0]; // primary fill
+  if (f.type === 'SOLID') {
+    const c = composeColor(f.color, f.opacity);
+    const shape = composeRadius(node);
+    if (shape) return `.background(${c}, ${shape})`;
+    return `.background(${c})`;
+  }
+  if (f.type === 'GRADIENT_LINEAR') {
+    const brush = composeLinearGradient(f);
+    if (brush) {
+      const shape = composeRadius(node);
+      if (shape) return `.background(brush = ${brush}, shape = ${shape})`;
+      return `.background(brush = ${brush})`;
+    }
+  }
+  if (f.type === 'GRADIENT_RADIAL') {
+    const brush = composeRadialGradient(f);
+    if (brush) return `.background(brush = ${brush})`;
+  }
+  return null;
+}
+
+function composeLinearGradient(fill) {
+  if (!fill.gradientStops || !fill.gradientStops.length) return null;
+  const colors = fill.gradientStops.map(s => composeColor(s.color, s.color && typeof s.color.a === 'number' ? s.color.a : 1));
+
+  let angle = 180;
+  try {
+    const gt = fill.gradientTransform;
+    if (gt && gt.length === 2) {
+      angle = (Math.atan2(gt[1][0], gt[0][0]) * 180) / Math.PI;
+      angle = (angle + 360) % 360;
+    }
+  } catch (e) {}
+
+  // Map angle to start/end offsets
+  let start, end;
+  const roundAngle = Math.round(angle);
+  if (roundAngle === 0 || roundAngle === 360) { start = 'Offset(Float.POSITIVE_INFINITY, 0f)'; end = 'Offset(0f, 0f)'; }
+  else if (roundAngle === 90) { start = 'Offset(0f, 0f)'; end = 'Offset(Float.POSITIVE_INFINITY, 0f)'; }
+  else if (roundAngle === 180) { start = 'Offset(0f, 0f)'; end = 'Offset(0f, Float.POSITIVE_INFINITY)'; }
+  else if (roundAngle === 270) { start = 'Offset(Float.POSITIVE_INFINITY, 0f)'; end = 'Offset(0f, 0f)'; }
+  else { start = 'Offset.Zero'; end = 'Offset.Infinite'; }
+
+  return `Brush.linearGradient(\n                colors = listOf(${colors.join(', ')}),\n                start = ${start},\n                end = ${end}\n            )`;
+}
+
+function composeRadialGradient(fill) {
+  if (!fill.gradientStops || !fill.gradientStops.length) return null;
+  const colors = fill.gradientStops.map(s => composeColor(s.color, s.color && typeof s.color.a === 'number' ? s.color.a : 1));
+  return `Brush.radialGradient(\n                colors = listOf(${colors.join(', ')})\n            )`;
+}
+
+function composeStrokes(node, colorSet, nextColorIdx) {
+  if (!node || !node.strokes || !Array.isArray(node.strokes)) return null;
+  const strokes = node.strokes.filter(s => s && s.visible !== false);
+  if (!strokes.length) return null;
+
+  const s = strokes[0];
+  if (s.type !== 'SOLID') return null;
+  const weight = typeof node.strokeWeight === 'number' ? node.strokeWeight : 1;
+  const c = composeColor(s.color, s.opacity);
+  const shape = composeRadius(node);
+  if (shape) return `.border(width = ${weight}.dp, color = ${c}, shape = ${shape})`;
+  return `.border(width = ${weight}.dp, color = ${c})`;
+}
+
+function composeRadius(node) {
+  if (!node) return null;
+  const hasTL = typeof node.topLeftRadius === 'number';
+  if (hasTL) {
+    const tl = node.topLeftRadius || 0;
+    const tr = node.topRightRadius || 0;
+    const br = node.bottomRightRadius || 0;
+    const bl = node.bottomLeftRadius || 0;
+    if (tl === 0 && tr === 0 && br === 0 && bl === 0) return null;
+    if (tl === tr && tr === br && br === bl) return `RoundedCornerShape(${tl}.dp)`;
+    return `RoundedCornerShape(topStart = ${tl}.dp, topEnd = ${tr}.dp, bottomEnd = ${br}.dp, bottomStart = ${bl}.dp)`;
+  }
+  if (typeof node.cornerRadius === 'number' && node.cornerRadius > 0) {
+    return `RoundedCornerShape(${node.cornerRadius}.dp)`;
+  }
+  return null;
+}
+
+function composeEffects(node) {
+  if (!node || !node.effects || !Array.isArray(node.effects)) return null;
+  const parts = [];
+  for (const e of node.effects) {
+    if (!e || e.visible === false) continue;
+    if (e.type === 'DROP_SHADOW') {
+      const blur = typeof e.radius === 'number' ? e.radius : 0;
+      // Use shadow modifier (Compose 1.6+)
+      parts.push(`.shadow(elevation = ${Math.max(blur / 3, 1)}.dp${composeRadius(node) ? ', shape = ' + composeRadius(node) : ''})`);
+    }
+    if (e.type === 'LAYER_BLUR') {
+      const r = typeof e.radius === 'number' ? e.radius : 0;
+      parts.push(`.blur(${r}.dp)`);
+    }
+    if (e.type === 'INNER_SHADOW') {
+      parts.push(` // TODO: Inner shadow not directly supported in Compose`);
+    }
+    if (e.type === 'BACKGROUND_BLUR') {
+      parts.push(` // TODO: Background blur requires API 31+ (RenderEffect)`);
+    }
+  }
+  return parts.length ? parts.join('\n            ') : null;
+}
+
+function composeText(node, indent, options, colorSet, nextColorIdx) {
+  const pad = '    '.repeat(indent);
+  const chars = node.characters || '';
+
+  // Try mixed text
+  let isMixed = false;
+  let segments = [];
+  try {
+    segments = node.getStyledTextSegments([
+      'fontName', 'fontSize', 'fontWeight', 'fills', 'lineHeight',
+      'letterSpacing', 'textDecoration', 'textCase'
+    ]);
+    if (segments && segments.length > 1) isMixed = true;
+  } catch (e) {}
+
+  if (isMixed) {
+    const spans = segments.map(seg => {
+      const styles = composeSpanStyle(seg, colorSet, nextColorIdx);
+      const escaped = escapeKotlinString(seg.characters);
+      if (styles) {
+        return `${pad}        withStyle(SpanStyle(${styles})) {\n${pad}            append("${escaped}")\n${pad}        }`;
+      }
+      return `${pad}        append("${escaped}")`;
+    });
+
+    const comment = node.name ? `${pad}// ${node.name}\n` : '';
+    return comment + `${pad}Text(\n${pad}    text = buildAnnotatedString {\n${spans.join('\n')}\n${pad}    }\n${pad})`;
+  }
+
+  // Simple text
+  const styleParts = [];
+  if (options.includeTextStyles) {
+    try {
+      if (node.fontSize && node.fontSize !== figma.mixed) styleParts.push(`fontSize = ${node.fontSize}.sp`);
+    } catch (e) {}
+
+    try {
+      if (node.fontName && node.fontName !== figma.mixed) {
+        const w = fontWeightFromStyle(node.fontName.style);
+        if (w) styleParts.push(`fontWeight = FontWeight(${w})`);
+        if (node.fontName.style && /italic/i.test(node.fontName.style)) styleParts.push('fontStyle = FontStyle.Italic');
+      }
+    } catch (e) {}
+
+    try {
+      if (node.fills && Array.isArray(node.fills)) {
+        const solid = node.fills.find(f => f && f.visible !== false && f.type === 'SOLID');
+        if (solid) styleParts.push(`color = ${composeColor(solid.color, solid.opacity)}`);
+      }
+    } catch (e) {}
+
+    try {
+      if (node.lineHeight && node.lineHeight !== figma.mixed && node.lineHeight.unit === 'PIXELS') {
+        styleParts.push(`lineHeight = ${node.lineHeight.value}.sp`);
+      }
+    } catch (e) {}
+
+    try {
+      if (node.letterSpacing && node.letterSpacing !== figma.mixed && node.letterSpacing.unit === 'PIXELS' && node.letterSpacing.value !== 0) {
+        styleParts.push(`letterSpacing = ${numF(node.letterSpacing.value)}.sp`);
+      }
+    } catch (e) {}
+
+    try {
+      if (node.textAlignHorizontal) {
+        const m = { LEFT: 'TextAlign.Start', CENTER: 'TextAlign.Center', RIGHT: 'TextAlign.End', JUSTIFIED: 'TextAlign.Justify' };
+        if (m[node.textAlignHorizontal]) styleParts.push(`textAlign = ${m[node.textAlignHorizontal]}`);
+      }
+    } catch (e) {}
+
+    try {
+      if (node.textDecoration) {
+        const m = { UNDERLINE: 'TextDecoration.Underline', STRIKETHROUGH: 'TextDecoration.LineThrough' };
+        if (m[node.textDecoration]) styleParts.push(`textDecoration = ${m[node.textDecoration]}`);
+      }
+    } catch (e) {}
+  }
+
+  const escaped = escapeKotlinString(chars);
+  const comment = node.name ? `${pad}// ${node.name}\n` : '';
+
+  if (styleParts.length) {
+    return comment + `${pad}Text(\n${pad}    text = "${escaped}",\n${pad}    style = TextStyle(\n${pad}        ${styleParts.join(',\n' + pad + '        ')}\n${pad}    )\n${pad})`;
+  }
+  return comment + `${pad}Text(text = "${escaped}")`;
+}
+
+function composeSpanStyle(seg, colorSet, nextColorIdx) {
+  const parts = [];
+  if (seg.fontSize) parts.push(`fontSize = ${seg.fontSize}.sp`);
+  if (seg.fontName) {
+    const w = fontWeightFromStyle(seg.fontName.style);
+    if (w) parts.push(`fontWeight = FontWeight(${w})`);
+    if (seg.fontName.style && /italic/i.test(seg.fontName.style)) parts.push('fontStyle = FontStyle.Italic');
+  }
+  if (seg.fills && Array.isArray(seg.fills)) {
+    const solid = seg.fills.find(f => f && f.visible !== false && f.type === 'SOLID');
+    if (solid) parts.push(`color = ${composeColor(solid.color, solid.opacity)}`);
+  }
+  if (seg.textDecoration) {
+    const m = { UNDERLINE: 'TextDecoration.Underline', STRIKETHROUGH: 'TextDecoration.LineThrough' };
+    if (m[seg.textDecoration]) parts.push(`textDecoration = ${m[seg.textDecoration]}`);
+  }
+  return parts.length ? parts.join(', ') : null;
+}
+
+function composeImage(resName, altName, w, h, indent) {
+  const pad = '    '.repeat(indent);
+  const comment = altName ? `${pad}// ${altName}\n` : '';
+  return comment +
+    `${pad}Image(\n` +
+    `${pad}    painter = painterResource(R.drawable.${resName}),\n` +
+    `${pad}    contentDescription = ${altName ? '"' + escapeKotlinString(altName) + '"' : 'null'},\n` +
+    `${pad}    modifier = Modifier.size(width = ${w}.dp, height = ${h}.dp),\n` +
+    `${pad}    contentScale = ContentScale.Crop\n` +
+    `${pad})`;
+}
+
+function composeColor(color, opacity) {
+  if (!color) return 'Color.Transparent';
+  const r = Math.round((color.r || 0) * 255);
+  const g = Math.round((color.g || 0) * 255);
+  const b = Math.round((color.b || 0) * 255);
+  const a = typeof opacity === 'number' ? opacity : (typeof color.a === 'number' ? color.a : 1);
+
+  if (r === 255 && g === 255 && b === 255 && a === 1) return 'Color.White';
+  if (r === 0 && g === 0 && b === 0 && a === 1) return 'Color.Black';
+  if (a === 1) return `Color(${r}, ${g}, ${b})`;
+  return `Color(${r}, ${g}, ${b}, ${Math.round(a * 255)})`;
+}
+
+// ── Output builders ──
+
+function buildComposeSingleOutput(screenName, body, components, colorSet) {
+  const imports = composeImports();
+  let code = `${imports}\n\n@Composable\nfun ${screenName}() {\n${body}\n}`;
+
+  for (const [name, compBody] of components) {
+    code += `\n\n@Composable\nfun ${name}() {\n${compBody}\n}`;
+  }
+  return code;
+}
+
+function buildComposeFileStructure(screenName, body, components, colorSet, imageAssets) {
+  const imports = composeImports();
+
+  // Screen.kt
+  const screenKt = `package ui\n\n${imports}\nimport ui.components.*\n\n@Composable\nfun ${screenName}() {\n${body}\n}`;
+
+  // Component files
+  const componentFiles = {};
+  for (const [name, compBody] of components) {
+    componentFiles[name] = `package ui.components\n\n${imports}\n\n@Composable\nfun ${name}() {\n${compBody}\n}`;
+  }
+
+  // Color.kt
+  const colorEntries = [];
+  if (colorSet && colorSet.size > 0) {
+    for (const [rgba, varName] of colorSet) {
+      colorEntries.push(`val ${varName} = ${rgba}`);
+    }
+  }
+  const colorKt = `package ui.theme\n\nimport androidx.compose.ui.graphics.Color\n\nobject AppColors {\n${colorEntries.length ? '    ' + colorEntries.join('\n    ') : '    // Colors extracted from design'}\n}`;
+
+  return {
+    mainCode: screenKt,
+    screenKt,
+    componentFiles,
+    colorKt,
+    imageAssets
+  };
+}
+
+function composeImports() {
+  return `import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.geometry.Offset`;
+}
+
+// ── Naming helpers ──
+
+function composeFunName(name) {
+  if (!name) return 'Unnamed';
+  // Convert to PascalCase, remove invalid chars
+  return name
+    .replace(/[^a-zA-Z0-9\s_\-/]/g, '')
+    .split(/[\s_\-/]+/)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join('') || 'Unnamed';
+}
+
+function escapeKotlinString(s) {
+  return String(s || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+    .replace(/\$/g, '\\$');
+}
+
+function numF(n) {
+  if (Number.isInteger(n)) return String(n);
+  return String(Math.round(n * 100) / 100);
 }

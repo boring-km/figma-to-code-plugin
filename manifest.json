@@ -1,6 +1,6 @@
 {
-  "name": "UI to HTML Exporter",
-  "id": "dev.kangmin.ui-to-html-exporter",
+  "name": "Figma to Code",
+  "id": "dev.kangmin.figma-to-code",
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
