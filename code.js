@@ -924,7 +924,9 @@ async function serializeComposeInner(node, indent, options, components, collectI
       const bytes = await node.exportAsync(buildExportSettings(options));
       const b64 = figma.base64Encode(bytes);
       const resName = collectImage(b64);
-      return composeImage(resName, node.name, width, height, indent);
+      const imgFill = node.fills.find(f => f && f.visible !== false && f.type === 'IMAGE');
+      const scaleMode = imgFill && imgFill.scaleMode ? imgFill.scaleMode : 'FILL';
+      return composeImage(resName, node.name, width, height, indent, scaleMode);
     } catch (e) {}
   }
 
@@ -1370,16 +1372,27 @@ function composeSpanStyle(seg, colorSet, nextColorIdx) {
   return parts.length ? parts.join(', ') : null;
 }
 
-function composeImage(resName, altName, w, h, indent) {
+function composeImage(resName, altName, w, h, indent, scaleMode) {
   const pad = '    '.repeat(indent);
   const comment = altName ? `${pad}// ${altName}\n` : '';
+  const contentScale = composeContentScale(scaleMode);
   return comment +
     `${pad}Image(\n` +
     `${pad}    painter = painterResource(R.drawable.${resName}),\n` +
     `${pad}    contentDescription = ${altName ? '"' + escapeKotlinString(altName) + '"' : 'null'},\n` +
     `${pad}    modifier = Modifier.size(width = ${w}.dp, height = ${h}.dp),\n` +
-    `${pad}    contentScale = ContentScale.Crop\n` +
+    `${pad}    contentScale = ${contentScale}\n` +
     `${pad})`;
+}
+
+function composeContentScale(scaleMode) {
+  const map = {
+    FILL: 'ContentScale.Crop',
+    FIT: 'ContentScale.Fit',
+    CROP: 'ContentScale.Crop',
+    TILE: 'ContentScale.None',
+  };
+  return map[scaleMode] || 'ContentScale.Crop';
 }
 
 function composeColor(color, opacity) {
